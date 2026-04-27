@@ -1,4 +1,5 @@
 import csv
+import os
 import sys
 import subprocess
 from dataclasses import dataclass
@@ -7,10 +8,11 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 import re
 
-from PyQt6.QtCore import Qt, QDate
+from PyQt6.QtCore import Qt, QDate, QSettings
 from PyQt6.QtGui import QAction, QFont, QIcon, QKeySequence, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDateEdit,
     QDialog,
     QFileDialog,
@@ -172,14 +174,70 @@ class GitCommitViewer(QMainWindow):
         self.setMinimumSize(1100, 720)
         self.setWindowIcon(get_app_icon())
 
+        self.settings = QSettings(APP_NAME, APP_NAME)
+        self.recent_repos: List[str] = []
         self.all_commits: List[CommitItem] = []
         self.filtered_commits: List[CommitItem] = []
         self.current_repo_path: str = ""
 
         self._init_ui()
 
-        self.repo_path_edit.setText(str(Path.home()))
+        self._load_settings()
         self.load_commits(show_errors=False)
+
+    def _default_start_date(self) -> QDate:
+        return QDate.currentDate().addDays(-5)
+
+    def _normalize_repo_path(self, repo_path: str) -> str:
+        s = (repo_path or "").strip()
+        if not s:
+            return ""
+        try:
+            return str(Path(s))
+        except Exception:
+            return s
+
+    def _repo_path_key(self, repo_path: str) -> str:
+        p = self._normalize_repo_path(repo_path)
+        if os.name == "nt":
+            return p.lower()
+        return p
+
+    def _get_repo_path(self) -> str:
+        return self._normalize_repo_path(self.repo_path_combo.currentText())
+
+    def _set_repo_path(self, repo_path: str):
+        p = self._normalize_repo_path(repo_path)
+        if not p:
+            return
+        self.repo_path_combo.setCurrentText(p)
+        self._remember_repo(p)
+
+    def _remember_repo(self, repo_path: str):
+        p = self._normalize_repo_path(repo_path)
+        if not p:
+            return
+        key = self._repo_path_key(p)
+        new_list: List[str] = [p]
+        seen = {key}
+        for item in self.recent_repos:
+            k = self._repo_path_key(item)
+            if k in seen:
+                continue
+            seen.add(k)
+            new_list.append(item)
+            if len(new_list) >= 20:
+                break
+        self.recent_repos = new_list
+        self.repo_path_combo.blockSignals(True)
+        try:
+            self.repo_path_combo.clear()
+            self.repo_path_combo.addItems(self.recent_repos)
+            self.repo_path_combo.setCurrentText(p)
+        finally:
+            self.repo_path_combo.blockSignals(False)
+        self.settings.setValue("recent_repos", self.recent_repos)
+        self.settings.setValue("repo_path", p)
 
     def _init_ui(self):
         central = QWidget()
@@ -190,22 +248,35 @@ class GitCommitViewer(QMainWindow):
 
         path_layout = QHBoxLayout()
         path_layout.addWidget(QLabel("仓库路径"))
-        self.repo_path_edit = QLineEdit()
-        self.repo_path_edit.setPlaceholderText("请选择包含 .git 的目录")
-        self.repo_path_edit.returnPressed.connect(self.load_commits)
+        self.repo_path_combo = QComboBox()
+        self.repo_path_combo.setEditable(True)
+        self.repo_path_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.repo_path_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        if self.repo_path_combo.lineEdit() is not None:
+            self.repo_path_combo.lineEdit().setPlaceholderText("请选择包含 .git 的目录")
+            self.repo_path_combo.lineEdit().returnPressed.connect(self.load_commits)
         self.btn_path = QPushButton("选择")
         self.btn_refresh = QPushButton("刷新")
-        path_layout.addWidget(self.repo_path_edit)
+        path_layout.addWidget(self.repo_path_combo)
         path_layout.addWidget(self.btn_path)
         path_layout.addWidget(self.btn_refresh)
         main_layout.addLayout(path_layout)
+
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(QLabel("导出目录"))
+        self.export_dir_edit = QLineEdit()
+        self.export_dir_edit.setPlaceholderText("选择导出保存目录")
+        self.btn_export_dir = QPushButton("选择")
+        export_layout.addWidget(self.export_dir_edit)
+        export_layout.addWidget(self.btn_export_dir)
+        main_layout.addLayout(export_layout)
 
         filter_layout = QHBoxLayout()
         self.author_edit = QLineEdit()
         self.author_edit.setPlaceholderText("作者（模糊匹配）")
         self.keyword_edit = QLineEdit()
         self.keyword_edit.setPlaceholderText("提交信息（关键词）")
-        self.start_date = QDateEdit(QDate(2020, 1, 1))
+        self.start_date = QDateEdit(self._default_start_date())
         self.start_date.setCalendarPopup(True)
         self.end_date = QDateEdit(QDate.currentDate())
         self.end_date.setCalendarPopup(True)
@@ -248,6 +319,8 @@ class GitCommitViewer(QMainWindow):
         self.btn_asc.clicked.connect(lambda: self.sort_commits(asc=True))
         self.btn_desc.clicked.connect(lambda: self.sort_commits(asc=False))
         self.btn_export.clicked.connect(self.export_csv)
+        self.btn_export_dir.clicked.connect(self.select_export_folder)
+        self.repo_path_combo.activated.connect(lambda _idx: self.load_commits())
 
         self.status = self.statusBar()
         self.status.showMessage("就绪")
@@ -301,10 +374,58 @@ class GitCommitViewer(QMainWindow):
         dlg.exec()
 
     def select_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "选择仓库目录")
+        folder = QFileDialog.getExistingDirectory(self, "选择仓库目录", self._get_repo_path() or str(Path.home()))
         if folder:
-            self.repo_path_edit.setText(folder)
+            self._set_repo_path(folder)
             self.load_commits()
+
+    def select_export_folder(self):
+        current = self.export_dir_edit.text().strip()
+        base_dir = current if current else str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "选择导出目录", base_dir)
+        if folder:
+            self.export_dir_edit.setText(folder)
+            self.settings.setValue("export_dir", folder)
+
+    def _load_settings(self):
+        repo_path = str(self.settings.value("repo_path", "") or "").strip()
+        recent = self.settings.value("recent_repos", [])
+        export_dir = str(self.settings.value("export_dir", "") or "").strip()
+
+        recent_list: List[str] = []
+        if isinstance(recent, list):
+            recent_list = [self._normalize_repo_path(x) for x in recent if str(x).strip()]
+        elif isinstance(recent, str) and recent.strip():
+            recent_list = [self._normalize_repo_path(recent)]
+
+        if repo_path:
+            self.recent_repos = [self._normalize_repo_path(repo_path)] + [
+                x for x in recent_list if self._repo_path_key(x) != self._repo_path_key(repo_path)
+            ]
+        else:
+            self.recent_repos = recent_list
+
+        self.recent_repos = [x for x in self.recent_repos if x]
+        if not self.recent_repos:
+            self.recent_repos = [str(Path.home())]
+
+        self.repo_path_combo.clear()
+        self.repo_path_combo.addItems(self.recent_repos)
+        if repo_path:
+            self.repo_path_combo.setCurrentText(self._normalize_repo_path(repo_path))
+        else:
+            self.repo_path_combo.setCurrentText(self.recent_repos[0])
+
+        if export_dir:
+            self.export_dir_edit.setText(export_dir)
+        else:
+            self.export_dir_edit.setText(str(Path.home()))
+
+    def closeEvent(self, event):
+        self.settings.setValue("repo_path", self._get_repo_path())
+        self.settings.setValue("recent_repos", self.recent_repos)
+        self.settings.setValue("export_dir", self.export_dir_edit.text().strip())
+        super().closeEvent(event)
 
     def _run_git(self, args: List[str], repo_path: str) -> str:
         try:
@@ -379,7 +500,7 @@ class GitCommitViewer(QMainWindow):
         return commits
 
     def load_commits(self, show_errors: bool = True):
-        repo_path = self.repo_path_edit.text().strip()
+        repo_path = self._get_repo_path()
         if not repo_path:
             return
 
@@ -411,6 +532,7 @@ class GitCommitViewer(QMainWindow):
             return
 
         self.current_repo_path = repo_path
+        self._remember_repo(repo_path)
         self.filtered_commits = list(self.all_commits)
         self.render_table()
         self.status.showMessage(f"加载完成：共 {len(self.all_commits)} 条记录")
@@ -461,7 +583,7 @@ class GitCommitViewer(QMainWindow):
     def clear_filter(self):
         self.author_edit.clear()
         self.keyword_edit.clear()
-        self.start_date.setDate(QDate(2020, 1, 1))
+        self.start_date.setDate(self._default_start_date())
         self.end_date.setDate(QDate.currentDate())
         self.filtered_commits = list(self.all_commits)
         self.render_table()
@@ -483,7 +605,7 @@ class GitCommitViewer(QMainWindow):
         commit = self._commit_by_row(row)
         if commit is None:
             return
-        repo_path = self.current_repo_path or self.repo_path_edit.text().strip()
+        repo_path = self.current_repo_path or self._get_repo_path()
         dlg = CommitDetailDialog(commit, repo_path, self)
         dlg.exec()
 
@@ -493,11 +615,26 @@ class GitCommitViewer(QMainWindow):
             return
 
         default_name = f"commits_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        path, _ = QFileDialog.getSaveFileName(self, "保存CSV", default_name, "CSV 文件 (*.csv)")
+        export_dir = self.export_dir_edit.text().strip()
+        default_path = default_name
+        if export_dir:
+            try:
+                p = Path(export_dir)
+                if p.exists():
+                    default_path = str(p / default_name)
+            except Exception:
+                default_path = default_name
+
+        path, _ = QFileDialog.getSaveFileName(self, "保存CSV", default_path, "CSV 文件 (*.csv)")
         if not path:
             return
 
         try:
+            parent_dir = str(Path(path).parent)
+            if parent_dir:
+                self.export_dir_edit.setText(parent_dir)
+                self.settings.setValue("export_dir", parent_dir)
+
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
                 writer.writerow(["序号", "短哈希", "完整哈希", "作者", "邮箱", "时间", "父提交", "标题", "完整信息"])
